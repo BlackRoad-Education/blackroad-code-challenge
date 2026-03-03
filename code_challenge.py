@@ -7,13 +7,99 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Ollama AI routing
+# ---------------------------------------------------------------------------
+
+# All of these @handles are routed directly to the local Ollama instance.
+# No external AI provider (Copilot, Claude, ChatGPT, etc.) is involved.
+OLLAMA_HANDLES = {"@copilot", "@lucidia", "@blackboxprogramming", "@ollama"}
+
+# Regex that matches any of the registered handles (case-insensitive, optional trailing dot)
+_HANDLE_RE = re.compile(
+    r"(" + "|".join(re.escape(h) for h in OLLAMA_HANDLES) + r")\.?",
+    re.IGNORECASE,
+)
+
+
+class OllamaClient:
+    """Thin client for a locally-running Ollama server."""
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        model: str = "llama3",
+        timeout: int = 120,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+
+    def _post(self, endpoint: str, payload: dict) -> dict:
+        url = f"{self.base_url}{endpoint}"
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.URLError as exc:
+            raise ConnectionError(
+                f"Cannot reach Ollama at {self.base_url}. "
+                "Make sure Ollama is running (`ollama serve`)."
+            ) from exc
+
+    def generate(self, prompt: str, system: str = "") -> str:
+        """Non-streaming generate call. Returns the response text."""
+        payload: dict = {"model": self.model, "prompt": prompt, "stream": False}
+        if system:
+            payload["system"] = system
+        result = self._post("/api/generate", payload)
+        return result.get("response", "")
+
+    def chat(self, messages: List[Dict[str, str]]) -> str:
+        """Chat-style call. Returns the assistant message content."""
+        payload = {"model": self.model, "messages": messages, "stream": False}
+        result = self._post("/api/chat", payload)
+        return result.get("message", {}).get("content", "")
+
+
+def route_ai_request(message: str, client: Optional["OllamaClient"] = None) -> Optional[str]:
+    """
+    Detect any Ollama handle in *message* and forward the request to Ollama.
+
+    Returns the Ollama response string when a handle is found, or ``None``
+    when no registered handle is present (so callers can fall back to
+    whatever they were doing before).
+    """
+    if not _HANDLE_RE.search(message):
+        return None
+
+    if client is None:
+        client = OllamaClient()
+
+    # Strip the handle from the message so the model only sees the real query.
+    clean = _HANDLE_RE.sub("", message).strip()
+    if not clean:
+        clean = "How can I help you?"
+
+    return client.generate(clean)
 
 
 # ---------------------------------------------------------------------------
@@ -361,10 +447,11 @@ def grade_submission(submission: Submission, challenge: Challenge) -> Submission
 class CodeChallengePlatform:
     """Main coding challenge platform."""
 
-    def __init__(self):
+    def __init__(self, ollama_base_url: str = "http://localhost:11434", ollama_model: str = "llama3"):
         self._challenges: Dict[str, Challenge] = {}
         self._submissions: Dict[str, Submission] = {}
         self._runner = CodeRunner()
+        self.ollama = OllamaClient(base_url=ollama_base_url, model=ollama_model)
 
     # ------------------------------------------------------------------
     # Challenge management
@@ -525,6 +612,25 @@ class CodeChallengePlatform:
                   "3. Consider time and space complexity.",
                   "4. Test with provided examples before submitting."]
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # AI assistant (Ollama)
+    # ------------------------------------------------------------------
+
+    def ask_ai(self, message: str) -> str:
+        """
+        Route an AI request to the local Ollama instance.
+
+        Any message that contains ``@copilot``, ``@lucidia``,
+        ``@blackboxprogramming``, or ``@ollama`` is automatically forwarded
+        to Ollama.  Plain messages (no handle) are also sent to Ollama so
+        that the platform never depends on any external AI provider.
+        """
+        response = route_ai_request(message, client=self.ollama)
+        if response is not None:
+            return response
+        # No handle detected — still route to Ollama, not to any third party.
+        return self.ollama.generate(message)
 
     # ------------------------------------------------------------------
     # Stats
